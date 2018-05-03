@@ -132,9 +132,14 @@ static void * kDFButtonTooltipArea = &kDFButtonTooltipArea;
 
 @property DFColorGridViewDefaultDelegate *defaultDelegate;
 
+@property BOOL registeredAsObserver;
+
 /// Whether we are currently updating the color panel's color and thus should ignore actions sent
 /// from the color panel.
 @property BOOL isUpdatingColorPanel;
+
+/// Point at which the mouse button was pressed.
+@property NSPoint mouseDownLocation;
 
 @end
 
@@ -150,6 +155,12 @@ static void * kDFButtonTooltipArea = &kDFButtonTooltipArea;
         panel.target = nil;
         panel.action = NULL;
     }
+	
+	// In case we're still registered as observer, unregister.
+	if (self.registeredAsObserver) {
+		[[NSColorPanel sharedColorPanel] removeObserver:self forKeyPath:@"target" context:nil];
+		self.registeredAsObserver = NO;
+	}
 }
 
 - (void) awakeFromNib {
@@ -215,7 +226,7 @@ static void * kDFButtonTooltipArea = &kDFButtonTooltipArea;
             return @"Click to show more colours or show your own.";
         }
     }
-    return nil;
+    return @"";
 }
 
 #pragma mark - Control private drawing methods
@@ -641,6 +652,14 @@ static void * kDFButtonTooltipArea = &kDFButtonTooltipArea;
     }
 }
 
+- (void) mouseDown:(NSEvent *)theEvent {
+    if (!self.enabled) {
+        return;
+    }
+    
+    self.mouseDownLocation = [self convertPoint:[theEvent locationInWindow] fromView:nil];
+}
+
 - (void) mouseUp:(NSEvent *)theEvent {
 
     if (!self.enabled) {
@@ -660,6 +679,19 @@ static void * kDFButtonTooltipArea = &kDFButtonTooltipArea;
 - (void) mouseDragged:(NSEvent *)theEvent {
     
     if (!self.enabled) {
+        return;
+    }
+    
+    // Check whether the mouse have moved a minimum distance. If the user clicks and slightly moves
+    // the mouse while the button is still down we don't want to start a drag as the to user it would
+    // look like "the click didn't work".
+    static const NSPoint minimumDelta = { .x = 2, .y = 2 };
+    NSPoint locationInView = [self convertPoint:[theEvent locationInWindow] fromView:nil];
+    CGFloat deltaX = fabs(locationInView.x - self.mouseDownLocation.x);
+    CGFloat deltaY = fabs(locationInView.y - self.mouseDownLocation.y);
+    
+    if (deltaX < minimumDelta.x && deltaY < minimumDelta.y) {
+        // Mouse hasn't moved far enough, don't start a drag yet.
         return;
     }
     
@@ -742,16 +774,38 @@ static void * kDFButtonTooltipArea = &kDFButtonTooltipArea;
         panel.showsAlpha = YES;
         panel.target = self;
         panel.action = @selector(handleColorPanelColorSelectionAction:);
-        self.isUpdatingColorPanel = YES;
+		self.isUpdatingColorPanel = YES;
         panel.color = self.color;
-        self.isUpdatingColorPanel = NO;
-        [panel orderFront:nil];
-        
+		self.isUpdatingColorPanel = NO;
+		[panel orderFront:nil];
+		
+		/* Try to observe the "target". If it changes, we're not the owner any more. Since it's not
+		 officially observable, we need to catch any exceptions. */
+		@try {
+			[panel addObserver:self forKeyPath:@"target" options:NSKeyValueObservingOptionNew context:nil];
+			self.registeredAsObserver = YES;
+		} @catch (NSException *exception) {
+		}
+		
         /* Capture the close of the color panel. */
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleWindowWillCloseNotification:) name:NSWindowWillCloseNotification object:panel];
         
     }
+}
 
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary<NSString *,id> *)change context:(void *)context
+{
+	if ([keyPath isEqualToString:@"target"]) {
+		/* The "owner" did change. Stop observing the panel. */
+		@try {
+			[object removeObserver:self forKeyPath:@"target" context:nil];
+			self.registeredAsObserver = NO;
+		} @catch (NSException *exception) {
+		}
+		
+		_shouldDrawButtonRegionWithSelectedColor = NO;
+		[self setNeedsDisplay:YES];
+	}
 }
 
 #pragma mark - Dealing with the NSColorPanel
@@ -817,12 +871,11 @@ static void * kDFButtonTooltipArea = &kDFButtonTooltipArea;
     if (color == nil) {
         return;
     }
-    
-    if ([_color isEqual:color]) {
-        // Don't re-apply the same color to prevent event loops.
-        return;
-    }
-    
+	
+	if ([_color isEqual:color]) {
+		return;
+	}
+	
     [self willChangeValueForKey:@"color"];
     _color = color;
     [self setNeedsDisplay:YES];
